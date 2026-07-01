@@ -1,4 +1,4 @@
-# Hardware Inventory Export
+# Hardware Inventory Export - Audited v3
 # Windows 11 / PowerShell 5.1+
 # Saves CSV to C:\Temp\<Manufacturer> <Model>.csv
 #
@@ -321,17 +321,30 @@ function Get-AccurateGpuInventory {
             $MemorySource = 'Win32_VideoController.AdapterRAM fallback; may be capped near 4 GB'
         }
 
-        $MemoryGB = Convert-BytesToGB $MemoryBytes
-        $MemoryText = if ($MemoryGB) { "$MemoryGB GB" } else { 'Unknown / Not Reported' }
+        $MemoryMiB = if ($MemoryBytes) { [math]::Round(([double]$MemoryBytes / 1MB), 0) } else { $null }
+        $MemoryGiB = if ($MemoryBytes) { [math]::Round(([double]$MemoryBytes / 1GB), 2) } else { $null }
+        $MemoryText = if ($MemoryGiB) { "$MemoryGiB GiB" } else { 'Unknown / Not Reported' }
+
+        # NVIDIA-SMI reports the physical memory installed on a discrete NVIDIA
+        # adapter. Registry/WMI values for integrated adapters can instead
+        # represent dedicated or preallocated memory, so use different wording.
+        $MemoryLabel = if ($MemorySource -eq 'NVIDIA-SMI') {
+            'Dedicated VRAM'
+        }
+        else {
+            'Dedicated/Preallocated Adapter Memory'
+        }
 
         $Results += [PSCustomObject]@{
             AdapterCompatibility = $Controller.AdapterCompatibility
             Name                 = $Controller.Name
             PNPDeviceID          = $Controller.PNPDeviceID
-            DedicatedVRAMBytes   = $MemoryBytes
-            DedicatedVRAMGB      = $MemoryGB
+            GPUMemoryBytes       = $MemoryBytes
+            GPUMemoryMiB         = $MemoryMiB
+            GPUMemoryGiB         = $MemoryGiB
+            GPUMemoryLabel       = $MemoryLabel
             VRAMSource           = $MemorySource
-            DisplayText          = "$($Controller.AdapterCompatibility) $($Controller.Name) - Dedicated/Preallocated Adapter Memory: $MemoryText - Memory Source: $MemorySource"
+            DisplayText          = "$($Controller.AdapterCompatibility) $($Controller.Name) - ${MemoryLabel}: $MemoryText - Memory Source: $MemorySource"
         }
     }
 
@@ -433,6 +446,19 @@ function Normalize-Text {
     return ($Value -replace '\s+', ' ').Trim()
 }
 
+function Normalize-SerialNumber {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ""
+    }
+
+    # Storage providers sometimes pad serials or append punctuation that is not
+    # part of the actual identifier. Preserve internal punctuation, but remove
+    # trailing spaces, periods, commas, semicolons, and colons.
+    return (Normalize-Text $Value).TrimEnd([char[]]".,;:")
+}
+
 # --- Computer Info ---
 $ComputerSystem = Get-CimInstance Win32_ComputerSystem
 $ComputerProduct = Get-CimInstance Win32_ComputerSystemProduct
@@ -459,11 +485,24 @@ $CPUName = ($CPUModels | Group-Object | ForEach-Object {
 }) -join ' | '
 $CPUCores = [int](($CPUObjects | Measure-Object NumberOfCores -Sum).Sum)
 $CPULogicalProcessors = [int](($CPUObjects | Measure-Object NumberOfLogicalProcessors -Sum).Sum)
-$CPUMaxClockMHz = [int](($CPUObjects | Measure-Object MaxClockSpeed -Maximum).Maximum)
+$CPUFirmwareReportedMaxClockMHz = [int](($CPUObjects | Measure-Object MaxClockSpeed -Maximum).Maximum)
 
 # --- GPUs ---
 $GpuInventory = @(Get-AccurateGpuInventory)
 $GPUs = @($GpuInventory | ForEach-Object { $_.DisplayText })
+
+# Pipe-delimited machine-readable GPU memory fields. Values are emitted in the
+# same adapter order as the GPU field so downstream parsers can align them.
+$GPUMemoryBytes = @($GpuInventory | ForEach-Object {
+    if ($null -eq $_.GPUMemoryBytes) { '' } else { [string]$_.GPUMemoryBytes }
+})
+$GPUMemoryMiB = @($GpuInventory | ForEach-Object {
+    if ($null -eq $_.GPUMemoryMiB) { '' } else { [string]$_.GPUMemoryMiB }
+})
+$GPUMemoryGiB = @($GpuInventory | ForEach-Object {
+    if ($null -eq $_.GPUMemoryGiB) { '' } else { [string]$_.GPUMemoryGiB }
+})
+$GPUMemorySources = @($GpuInventory | ForEach-Object { [string]$_.VRAMSource })
 
 if ($GpuInventory | Where-Object { $_.VRAMSource -like 'Win32_VideoController*' }) {
     Add-InventoryWarning 'At least one GPU used the 32-bit AdapterRAM fallback; VRAM may be truncated.'
@@ -507,7 +546,7 @@ try {
         $CapacityGB = Convert-BytesToDecimalGB $Disk.Size
         $CapacityGiB = Convert-BytesToGiB $Disk.Size
         $Firmware = if ($Physical.FirmwareVersion) { Normalize-Text $Physical.FirmwareVersion } else { '' }
-        $Serial = if ($Wmi.SerialNumber) { Normalize-Text $Wmi.SerialNumber } elseif ($Disk.SerialNumber) { Normalize-Text $Disk.SerialNumber } else { '' }
+        $Serial = if ($Wmi.SerialNumber) { Normalize-SerialNumber $Wmi.SerialNumber } elseif ($Disk.SerialNumber) { Normalize-SerialNumber $Disk.SerialNumber } else { '' }
 
         $Drives += "$Manufacturer $Model - Capacity: $CapacityGB GB decimal ($CapacityGiB GiB) - MediaType: $MediaType - MediaType Source: $MediaSource - Interface: $Interface - Interface Source: $InterfaceConfidence - Reported Bus: $ReportedBus - System Disk: $IsSystemDisk - Firmware: $Firmware - Serial: $Serial"
     }
@@ -516,7 +555,7 @@ catch {
     Add-InventoryWarning "Primary storage inventory failed: $($_.Exception.Message)"
     $DiskDrives = @(Get-CimInstance Win32_DiskDrive | Where-Object { $_.InterfaceType -notin @('USB','Network') })
     foreach ($Disk in $DiskDrives) {
-        $Drives += "$(Normalize-Text $Disk.Manufacturer) $(Normalize-Text $Disk.Model) - Capacity: $(Convert-BytesToDecimalGB $Disk.Size) GB decimal ($(Convert-BytesToGiB $Disk.Size) GiB) - MediaType: Unknown / Not Reported - Interface: $($Disk.InterfaceType) - System Disk: Unknown - Serial: $(Normalize-Text $Disk.SerialNumber)"
+        $Drives += "$(Normalize-Text $Disk.Manufacturer) $(Normalize-Text $Disk.Model) - Capacity: $(Convert-BytesToDecimalGB $Disk.Size) GB decimal ($(Convert-BytesToGiB $Disk.Size) GiB) - MediaType: Unknown / Not Reported - Interface: $($Disk.InterfaceType) - System Disk: Unknown - Serial: $(Normalize-SerialNumber $Disk.SerialNumber)"
     }
 }
 
@@ -535,7 +574,14 @@ $RAMDetails = $RAMModules | ForEach-Object {
     $FormFactor = Get-MemoryFormFactorName -FormFactor ([int]$_.FormFactor)
     $ConfiguredSpeed = if ($_.ConfiguredClockSpeed -gt 0) { $_.ConfiguredClockSpeed } else { $_.Speed }
     $RatedSpeed = if ($_.Speed -gt 0) { $_.Speed } else { 'Unknown' }
-    "$(Normalize-Text $_.Manufacturer) $(Normalize-Text $_.PartNumber) - Capacity: $(Convert-BytesToGiB $_.Capacity) GiB - Type: $TypeName - Form Factor: $FormFactor - Configured Speed: $ConfiguredSpeed MHz - Rated Speed: $RatedSpeed MHz - Slot: $(Normalize-Text $_.DeviceLocator) - Bank: $(Normalize-Text $_.BankLabel) - Replaceable Flag: $($_.Replaceable)"
+    $ReplaceableFlag = if ($null -eq $_.Replaceable -or [string]::IsNullOrWhiteSpace([string]$_.Replaceable)) {
+        'Unknown / Not Reported'
+    }
+    else {
+        [string]$_.Replaceable
+    }
+
+    "$(Normalize-Text $_.Manufacturer) $(Normalize-Text $_.PartNumber) - Capacity: $(Convert-BytesToGiB $_.Capacity) GiB - Type: $TypeName - Form Factor: $FormFactor - Configured Speed: $ConfiguredSpeed MHz - Rated Speed: $RatedSpeed MHz - Slot: $(Normalize-Text $_.DeviceLocator) - Bank: $(Normalize-Text $_.BankLabel) - Replaceable Flag: $ReplaceableFlag"
 }
 
 # --- Network Adapters ---
@@ -565,9 +611,13 @@ $Inventory = [PSCustomObject]@{
     CPUPhysicalPackageCount  = $CPUCount
     CPUCores                 = $CPUCores
     CPULogicalProcessors     = $CPULogicalProcessors
-    CPUMaxClockMHz           = $CPUMaxClockMHz
+    CPUFirmwareReportedMaxClockMHz = $CPUFirmwareReportedMaxClockMHz
 
     GPU                      = ($GPUs -join " | ")
+    GPUMemoryBytes           = ($GPUMemoryBytes -join " | ")
+    GPUMemoryMiB             = ($GPUMemoryMiB -join " | ")
+    GPUMemoryGiB             = ($GPUMemoryGiB -join " | ")
+    GPUMemorySources         = ($GPUMemorySources -join " | ")
 
     Drives                   = ($Drives -join " | ")
 
@@ -588,4 +638,4 @@ $Inventory | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
 Write-Output "Hardware inventory saved to: $OutFile"
 
 # Also show GPU detection details in the console for validation.
-$GpuInventory | Select-Object Name, DedicatedVRAMGB, VRAMSource | Format-Table -AutoSize
+$GpuInventory | Select-Object Name, GPUMemoryMiB, GPUMemoryGiB, GPUMemoryLabel, VRAMSource | Format-Table -AutoSize
