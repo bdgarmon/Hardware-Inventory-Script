@@ -838,10 +838,28 @@ function Test-PlaceholderIdentifier {
 
 function Get-VideoOutputTechnologyName {
 
-    param([Nullable[Int32]]$Code)
+    param([object]$Code)
 
+    if ($null -eq $Code) {
+        return "Unknown / Not Reported"
+    }
 
-    switch ([int]$Code) {
+    try {
+        $NumericCode = [Int64]$Code
+    }
+    catch {
+        return "Unknown / Not Reported"
+    }
+
+    # WMI/CIM can expose the signed D3DKMDT values as UInt32.
+    if ($NumericCode -eq 4294967295) {
+        $NumericCode = -1
+    }
+    elseif ($NumericCode -eq 4294967294) {
+        $NumericCode = -2
+    }
+
+    switch ($NumericCode) {
 
         -2 { "Uninitialized" }
         -1 { "Other" }
@@ -1715,6 +1733,12 @@ $AvailableExpansionSlotCount = @(
 $ExpansionSlotConfidence = if ($ExpansionSlotInventory.Count -eq 0) {
     "Not reported by system firmware; physical inspection or manufacturer documentation required"
 }
+elseif ($AvailableExpansionSlotCount -gt 0) {
+    "One or more slots are reported available by firmware; physical accessibility, lane wiring, bracket fit, and clearance remain unconfirmed"
+}
+else {
+    "Slots were reported, but no slot was affirmatively reported available; physical inspection or manufacturer documentation required"
+}
 
 $PCIeDevicesWithLinkData = @(
     $PciDeviceInventory |
@@ -1738,12 +1762,6 @@ else {
 
 $ExpansionSlotWarnings =
     "Firmware-reported slot presence or availability does not prove physical access, electrical lane wiring, bracket height, card-length clearance, cooling clearance, or that another installed device blocks the slot. Confirm important upgrades with service documentation or physical inspection."
-elseif ($AvailableExpansionSlotCount -gt 0) {
-    "One or more slots are reported available by firmware; physical accessibility, lane wiring, bracket fit, and clearance remain unconfirmed"
-}
-else {
-    "Slots were reported, but no slot was affirmatively reported available; physical inspection or manufacturer documentation required"
-}
 
 if ($ExpansionSlotInventory.Count -eq 0) {
     Add-InventoryWarning "System firmware did not expose any Win32_SystemSlot records."
