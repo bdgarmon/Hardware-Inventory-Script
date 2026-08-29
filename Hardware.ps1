@@ -1,15 +1,6 @@
-# Hardware Inventory Export - Audited v4
+# Hardware Inventory Export - Audited v5
 # Windows 11 / PowerShell 5.1+
 # Saves CSV to C:\Temp\<Manufacturer> <Model>.csv
-#
-# v4 additions:
-#   - GPU driver version
-#   - GPU driver date
-#   - Current display resolution
-#   - Current refresh rate
-#   - Active display connection type
-#   - Audio devices
-#   - CPU family/model/stepping metadata
 #
 # GPU memory collection order:
 #   1. NVIDIA-SMI for NVIDIA adapters when available
@@ -47,6 +38,36 @@ function Clean-FileName {
     return ($Name -replace $regex, '').Trim()
 }
 
+
+function Get-WindowsDisplayVersion {
+
+    try {
+
+        $CurrentVersion = Get-ItemProperty `
+            -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' `
+            -ErrorAction Stop
+
+        if (-not [string]::IsNullOrWhiteSpace($CurrentVersion.DisplayVersion)) {
+            return $CurrentVersion.DisplayVersion
+        }
+
+        # Fallback for older Windows releases
+        if (-not [string]::IsNullOrWhiteSpace($CurrentVersion.ReleaseId)) {
+            return $CurrentVersion.ReleaseId
+        }
+
+        return "Unknown"
+
+    }
+    catch {
+
+        Add-InventoryWarning `
+            "Unable to determine Windows display version: $($_.Exception.Message)"
+
+        return "Unknown"
+
+    }
+}
 
 function Normalize-Text {
     param([string]$Value)
@@ -772,34 +793,23 @@ function Test-PlaceholderIdentifier {
 
     param([string]$Value)
 
-
     if ([string]::IsNullOrWhiteSpace($Value)) {
-
         return $true
-
     }
 
-
-    $v =
-        ($Value -replace '[^A-Fa-f0-9]','')
-        .ToUpperInvariant()
-
+    $v = ($Value -replace '[^A-Fa-f0-9]','').ToUpperInvariant()
 
     if ($v -and
         ($v -match '^0+$' -or $v -match '^F+$')) {
 
         return $true
-
     }
-
 
     return (
         $Value -match
         'To Be Filled|Default String|System Serial|Unknown|None'
     )
-
-}
-function Get-CpuFamilyModelStepping {
+}function Get-CpuFamilyModelStepping {
 
     param($Processor)
 
@@ -823,7 +833,6 @@ function Get-CpuFamilyModelStepping {
     return $Description
 
 }
-
 
 
 
@@ -1012,6 +1021,399 @@ function Get-AudioDeviceInventory {
 
     }
 
+}
+
+
+function Get-DriveInventory {
+
+    $Results = @()
+    $PhysicalDisks = @()
+
+    try {
+        $PhysicalDisks = @(Get-PhysicalDisk -ErrorAction Stop)
+    }
+    catch {
+        Add-InventoryWarning "Get-PhysicalDisk was unavailable: $($_.Exception.Message)"
+    }
+
+    try {
+        $Disks = @(Get-Disk -ErrorAction Stop)
+
+        foreach ($Disk in $Disks) {
+
+            $Physical = $PhysicalDisks |
+                Where-Object {
+                    $_.DeviceId -eq $Disk.Number -or
+                    (Normalize-Text $_.FriendlyName) -eq (Normalize-Text $Disk.FriendlyName)
+                } |
+                Select-Object -First 1
+
+            $MediaType = if ($Physical) {
+                Normalize-Text ([string]$Physical.MediaType)
+            }
+            else {
+                "Unknown / Not Reported"
+            }
+
+            $Results += [PSCustomObject]@{
+                Number = $Disk.Number
+                Model = Normalize-Text $Disk.FriendlyName
+                SerialNumber = Normalize-Text $Disk.SerialNumber
+                Firmware = Normalize-Text $Disk.FirmwareVersion
+                SizeBytes = [UInt64]$Disk.Size
+                CapacityDecimalGB = Convert-BytesToDecimalGB $Disk.Size
+                CapacityGiB = Convert-BytesToGiB $Disk.Size
+                MediaType = $MediaType
+                BusType = Normalize-Text ([string]$Disk.BusType)
+                PartitionStyle = Normalize-Text ([string]$Disk.PartitionStyle)
+                IsSystem = [bool]$Disk.IsSystem
+                IsBoot = [bool]$Disk.IsBoot
+                HealthStatus = Normalize-Text ([string]$Disk.HealthStatus)
+            }
+        }
+    }
+    catch {
+        Add-InventoryWarning "Get-Disk inventory failed: $($_.Exception.Message)"
+
+        try {
+            foreach ($Disk in @(Get-CimInstance Win32_DiskDrive -ErrorAction Stop)) {
+                $Results += [PSCustomObject]@{
+                    Number = $Disk.Index
+                    Model = Normalize-Text $Disk.Model
+                    SerialNumber = Normalize-Text $Disk.SerialNumber
+                    Firmware = Normalize-Text $Disk.FirmwareRevision
+                    SizeBytes = [UInt64]$Disk.Size
+                    CapacityDecimalGB = Convert-BytesToDecimalGB $Disk.Size
+                    CapacityGiB = Convert-BytesToGiB $Disk.Size
+                    MediaType = Normalize-Text $Disk.MediaType
+                    BusType = Normalize-Text $Disk.InterfaceType
+                    PartitionStyle = "Unknown / Not Reported"
+                    IsSystem = $null
+                    IsBoot = $null
+                    HealthStatus = Normalize-Text $Disk.Status
+                }
+            }
+        }
+        catch {
+            Add-InventoryWarning "Fallback disk inventory failed: $($_.Exception.Message)"
+        }
+    }
+
+    return $Results
+}
+
+
+function Get-RamInventory {
+
+    $Results = @()
+
+    try {
+        foreach ($Module in @(Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop)) {
+
+            $MemoryTypeCode = if ($Module.SMBIOSMemoryType) {
+                [int]$Module.SMBIOSMemoryType
+            }
+            else {
+                [int]$Module.MemoryType
+            }
+
+            $FormFactor = Get-MemoryFormFactorName ([int]$Module.FormFactor)
+            $Replaceable = if ($FormFactor -match 'Soldered|BGA|SMD|LGA') {
+                "No / Soldered"
+            }
+            elseif ($FormFactor -match 'DIMM|SODIMM') {
+                "Likely replaceable"
+            }
+            else {
+                "Unknown / Not Reported"
+            }
+
+            $Results += [PSCustomObject]@{
+                Manufacturer = Normalize-Text $Module.Manufacturer
+                PartNumber = Normalize-Text $Module.PartNumber
+                SerialNumber = Normalize-Text $Module.SerialNumber
+                CapacityBytes = [UInt64]$Module.Capacity
+                CapacityGiB = Convert-BytesToGiB $Module.Capacity
+                MemoryType = Get-MemoryTypeName $MemoryTypeCode
+                FormFactor = $FormFactor
+                ConfiguredSpeedMHz = $Module.ConfiguredClockSpeed
+                RatedSpeedMHz = $Module.Speed
+                DeviceLocator = Normalize-Text $Module.DeviceLocator
+                BankLabel = Normalize-Text $Module.BankLabel
+                Replaceable = $Replaceable
+            }
+        }
+    }
+    catch {
+        Add-InventoryWarning "RAM inventory failed: $($_.Exception.Message)"
+    }
+
+    return $Results
+}
+
+
+function Get-NetworkInventory {
+
+    $Results = @()
+
+    try {
+        foreach ($Adapter in @(Get-NetAdapter -IncludeHidden -ErrorAction Stop)) {
+
+            if (-not $Adapter.HardwareInterface) {
+                continue
+            }
+
+            $Type = if ($Adapter.Name -match 'Wi-?Fi|Wireless' -or
+                $Adapter.InterfaceDescription -match 'Wi-?Fi|Wireless|802\.11') {
+                "Wi-Fi"
+            }
+            elseif ($Adapter.InterfaceDescription -match 'Bluetooth') {
+                "Bluetooth"
+            }
+            else {
+                "Ethernet"
+            }
+
+            $Results += [PSCustomObject]@{
+                Type = $Type
+                Name = Normalize-Text $Adapter.Name
+                Description = Normalize-Text $Adapter.InterfaceDescription
+                Status = Normalize-Text ([string]$Adapter.Status)
+                LinkSpeed = if ($Adapter.LinkSpeed) {
+                    Normalize-Text ([string]$Adapter.LinkSpeed)
+                }
+                else {
+                    "Unknown / Not Connected"
+                }
+                MacAddress = Normalize-Text $Adapter.MacAddress
+                InterfaceGuid = Normalize-Text ([string]$Adapter.InterfaceGuid)
+                PnpDeviceId = Normalize-Text $Adapter.PnPDeviceID
+            }
+        }
+    }
+    catch {
+        Add-InventoryWarning "Get-NetAdapter inventory failed: $($_.Exception.Message)"
+
+        try {
+            foreach ($Adapter in @(Get-CimInstance Win32_NetworkAdapter -Filter "PhysicalAdapter=True" -ErrorAction Stop)) {
+                $Results += [PSCustomObject]@{
+                    Type = "Unknown"
+                    Name = Normalize-Text $Adapter.NetConnectionID
+                    Description = Normalize-Text $Adapter.Name
+                    Status = Normalize-Text $Adapter.NetConnectionStatus
+                    LinkSpeed = Get-NicSpeed ([UInt64]$Adapter.Speed)
+                    MacAddress = Normalize-Text $Adapter.MACAddress
+                    InterfaceGuid = Normalize-Text $Adapter.GUID
+                    PnpDeviceId = Normalize-Text $Adapter.PNPDeviceID
+                }
+            }
+        }
+        catch {
+            Add-InventoryWarning "Fallback network inventory failed: $($_.Exception.Message)"
+        }
+    }
+
+    return $Results
+}
+
+
+function Get-SystemSlotUsageName {
+    param([Nullable[Int32]]$Code)
+
+    switch ([int]$Code) {
+        1 { "Other" }
+        2 { "Unknown" }
+        3 { "Available" }
+        4 { "In Use" }
+        5 { "Unavailable" }
+        default { "Unknown / Not Reported" }
+    }
+}
+
+
+function Get-SystemSlotAvailabilityName {
+    param([Nullable[Int32]]$Code)
+
+    switch ([int]$Code) {
+         3 { "Running / Full Power" }
+         4 { "Warning" }
+         5 { "In Test" }
+         8 { "Off Line" }
+        11 { "Not Installed" }
+        12 { "Install Error" }
+        13 { "Power Save - Unknown" }
+        14 { "Power Save - Low Power Mode" }
+        15 { "Power Save - Standby" }
+        16 { "Power Cycle" }
+        17 { "Power Save - Warning" }
+        default { "Unknown / Not Reported" }
+    }
+}
+
+
+function Get-MotherboardInventory {
+
+    try {
+        $Boards = @(Get-CimInstance Win32_BaseBoard -ErrorAction Stop)
+
+        return @(
+            $Boards | ForEach-Object {
+                [PSCustomObject]@{
+                    Manufacturer = Normalize-Text $_.Manufacturer
+                    Model = Normalize-Text $_.Model
+                    Product = Normalize-Text $_.Product
+                    PartNumber = Normalize-Text $_.PartNumber
+                    SKU = Normalize-Text $_.SKU
+                    Version = Normalize-Text $_.Version
+                    SerialNumber = Normalize-Text $_.SerialNumber
+                    Tag = Normalize-Text $_.Tag
+                    SlotLayout = Normalize-Text $_.SlotLayout
+                    HostingBoard = $_.HostingBoard
+                    Replaceable = $_.Replaceable
+                    Removable = $_.Removable
+                    RequiresDaughterBoard = $_.RequiresDaughterBoard
+                    PoweredOn = $_.PoweredOn
+                }
+            }
+        )
+    }
+    catch {
+        Add-InventoryWarning "Motherboard inventory failed: $($_.Exception.Message)"
+        return @()
+    }
+}
+
+
+function Get-ExpansionSlotInventory {
+
+    $Results = @()
+
+    try {
+        foreach ($Slot in @(Get-CimInstance Win32_SystemSlot -ErrorAction Stop)) {
+
+            $Usage = Get-SystemSlotUsageName $Slot.CurrentUsage
+
+            $Results += [PSCustomObject]@{
+                SlotDesignation = Normalize-Text $Slot.SlotDesignation
+                Description = Normalize-Text $Slot.Description
+                Tag = Normalize-Text $Slot.Tag
+                Status = Normalize-Text $Slot.Status
+                CurrentUsage = $Usage
+                Availability = Get-SystemSlotAvailabilityName $Slot.Availability
+                MaxDataWidth = $Slot.MaxDataWidth
+                BusNumber = $Slot.BusNumber
+                DeviceNumber = $Slot.DeviceNumber
+                FunctionNumber = $Slot.FunctionNumber
+                SegmentGroupNumber = $Slot.SegmentGroupNumber
+                Shared = $Slot.Shared
+                SupportsHotPlug = $Slot.SupportsHotPlug
+                PMESignal = $Slot.PMESignal
+                Confidence = if ($Usage -eq "Available") {
+                    "Reported available by firmware"
+                }
+                elseif ($Usage -eq "In Use") {
+                    "Reported occupied by firmware"
+                }
+                else {
+                    "Presence reported; occupancy unknown"
+                }
+            }
+        }
+    }
+    catch {
+        Add-InventoryWarning "Expansion-slot inventory failed: $($_.Exception.Message)"
+    }
+
+    return $Results
+}
+
+
+function Get-PciDeviceInventory {
+
+    $Results = @()
+
+    try {
+        $Devices = @(Get-CimInstance Win32_PnPEntity -Filter "PNPDeviceID LIKE 'PCI%'" -ErrorAction Stop)
+
+        foreach ($Device in $Devices) {
+
+            $Properties = @()
+
+            if (Get-Command Get-PnpDeviceProperty -ErrorAction SilentlyContinue) {
+                try {
+                    $Properties = @(
+                        Get-PnpDeviceProperty -InstanceId $Device.PNPDeviceID -ErrorAction Stop |
+                        Where-Object {
+                            $_.KeyName -match 'LocationInfo|LocationPaths|PciDevice_.*Link(Speed|Width)'
+                        }
+                    )
+                }
+                catch {
+                    # Some devices deny individual property queries. Keep the CIM record.
+                }
+            }
+
+            function Get-DevicePropertyValue {
+                param([string]$Pattern)
+
+                $Match = $Properties |
+                    Where-Object { $_.KeyName -match $Pattern } |
+                    Select-Object -First 1
+
+                if ($Match) {
+                    return Normalize-Text (($Match.Data -join " | "))
+                }
+
+                return "Unknown / Not Exposed"
+            }
+
+            $Results += [PSCustomObject]@{
+                Name = Normalize-Text $Device.Name
+                Manufacturer = Normalize-Text $Device.Manufacturer
+                PnpClass = Normalize-Text $Device.PNPClass
+                Status = Normalize-Text $Device.Status
+                Service = Normalize-Text $Device.Service
+                PnpDeviceId = Normalize-Text $Device.PNPDeviceID
+                LocationInfo = Get-DevicePropertyValue 'LocationInfo$'
+                LocationPaths = Get-DevicePropertyValue 'LocationPaths$'
+                CurrentLinkSpeed = Get-DevicePropertyValue 'PciDevice_CurrentLinkSpeed$'
+                CurrentLinkWidth = Get-DevicePropertyValue 'PciDevice_CurrentLinkWidth$'
+                MaxLinkSpeed = Get-DevicePropertyValue 'PciDevice_MaxLinkSpeed$'
+                MaxLinkWidth = Get-DevicePropertyValue 'PciDevice_MaxLinkWidth$'
+            }
+        }
+    }
+    catch {
+        Add-InventoryWarning "PCI/PCIe device inventory failed: $($_.Exception.Message)"
+    }
+
+    return $Results
+}
+
+
+function Get-FirmwareBootMode {
+
+    try {
+        $null = Confirm-SecureBootUEFI -ErrorAction Stop
+        return "UEFI"
+    }
+    catch {
+        try {
+            $FirmwareType = Get-ItemPropertyValue `
+                -Path 'HKLM:\SYSTEM\CurrentControlSet\Control' `
+                -Name PEFirmwareType `
+                -ErrorAction Stop
+
+            switch ([int]$FirmwareType) {
+                1 { return "Legacy BIOS" }
+                2 { return "UEFI" }
+                default { return "Unknown / Not Reported" }
+            }
+        }
+        catch {
+            return "Unknown / Not Reported"
+        }
+    }
 }
 
 
@@ -1227,6 +1629,130 @@ $AudioDevices =
 
 
 
+# -----------------------------
+# STORAGE / RAM / NETWORK
+# -----------------------------
+
+$DriveInventory = @(Get-DriveInventory)
+
+$Drives = @(
+    $DriveInventory | ForEach-Object {
+        "$($_.Model) - Capacity: $($_.CapacityDecimalGB) GB decimal ($($_.CapacityGiB) GiB) - MediaType: $($_.MediaType) - Bus: $($_.BusType) - Partition Style: $($_.PartitionStyle) - System Disk: $($_.IsSystem) - Boot Disk: $($_.IsBoot) - Health: $($_.HealthStatus) - Firmware: $($_.Firmware) - Serial: $($_.SerialNumber)"
+    }
+)
+
+$RamInventory = @(Get-RamInventory)
+
+$TotalRAMGB = if ($RamInventory.Count -gt 0) {
+    [math]::Round((($RamInventory | Measure-Object CapacityBytes -Sum).Sum / 1GB), 2)
+}
+else {
+    $null
+}
+
+$RAMDetails = @(
+    $RamInventory | ForEach-Object {
+        "$($_.Manufacturer) $($_.PartNumber) - Capacity: $($_.CapacityGiB) GiB - Type: $($_.MemoryType) - Form Factor: $($_.FormFactor) - Configured Speed: $($_.ConfiguredSpeedMHz) MHz - Rated Speed: $($_.RatedSpeedMHz) MHz - Slot: $($_.DeviceLocator) - Bank: $($_.BankLabel) - Replaceable: $($_.Replaceable)"
+    }
+)
+
+$NetworkInventory = @(Get-NetworkInventory)
+
+$NICDetails = @(
+    $NetworkInventory | ForEach-Object {
+        "$($_.Type) - $($_.Description) - Name: $($_.Name) - Status: $($_.Status) - Current Negotiated Link Speed: $($_.LinkSpeed) - MAC: $($_.MacAddress) - Interface GUID: $($_.InterfaceGuid) - PNP Device ID: $($_.PnpDeviceId)"
+    }
+)
+
+
+# -----------------------------
+# MOTHERBOARD / BIOS / PCIe
+# -----------------------------
+
+$MotherboardInventory = @(Get-MotherboardInventory)
+$ExpansionSlotInventory = @(Get-ExpansionSlotInventory)
+$PciDeviceInventory = @(Get-PciDeviceInventory)
+$FirmwareBootMode = Get-FirmwareBootMode
+
+$MotherboardDetails = @(
+    $MotherboardInventory | ForEach-Object {
+        "$($_.Manufacturer) $($_.Product) - Model: $($_.Model) - Part Number: $($_.PartNumber) - SKU: $($_.SKU) - Version: $($_.Version) - Serial: $($_.SerialNumber) - Board Tag: $($_.Tag) - Slot Layout: $($_.SlotLayout) - Hosting Board: $($_.HostingBoard) - Replaceable: $($_.Replaceable) - Removable: $($_.Removable) - Requires Daughterboard: $($_.RequiresDaughterBoard) - Powered On: $($_.PoweredOn)"
+    }
+) -join " | "
+
+$PrimaryBoard = $MotherboardInventory | Select-Object -First 1
+
+$BIOSReleaseDate = if ($BIOS.ReleaseDate -is [datetime]) {
+    $BIOS.ReleaseDate.ToString("yyyy-MM-dd")
+}
+else {
+    Convert-CimDateTimeToIsoDate $BIOS.ReleaseDate
+}
+
+$BIOSVersionText =
+    ((@($BIOS.BIOSVersion) | ForEach-Object { Normalize-Text $_ }) -join " | ")
+
+$BIOSDetails =
+    "Manufacturer: $(Normalize-Text $BIOS.Manufacturer) - Name: $(Normalize-Text $BIOS.Name) - Version: $BIOSVersionText - SMBIOS Version: $($BIOS.SMBIOSBIOSVersion) - SMBIOS Major.Minor: $($BIOS.SMBIOSMajorVersion).$($BIOS.SMBIOSMinorVersion) - Release Date: $BIOSReleaseDate - Boot Mode: $FirmwareBootMode"
+
+$ExpansionSlots = @(
+    $ExpansionSlotInventory | ForEach-Object {
+        "$($_.SlotDesignation) - Description: $($_.Description) - Usage: $($_.CurrentUsage) - Availability: $($_.Availability) - Status: $($_.Status) - Max Data Width: $($_.MaxDataWidth) - BDF: Segment $($_.SegmentGroupNumber), Bus $($_.BusNumber), Device $($_.DeviceNumber), Function $($_.FunctionNumber) - Shared: $($_.Shared) - Hot Plug: $($_.SupportsHotPlug) - PME: $($_.PMESignal) - Confidence: $($_.Confidence)"
+    }
+)
+
+$InstalledPCIeDevices = @(
+    $PciDeviceInventory | ForEach-Object {
+        "$($_.Name) - Manufacturer: $($_.Manufacturer) - Class: $($_.PnpClass) - Status: $($_.Status) - Service: $($_.Service) - Location: $($_.LocationInfo) - Current Link: $($_.CurrentLinkSpeed) x$($_.CurrentLinkWidth) - Maximum Link: $($_.MaxLinkSpeed) x$($_.MaxLinkWidth) - PNP Device ID: $($_.PnpDeviceId)"
+    }
+)
+
+$AvailableExpansionSlotCount = @(
+    $ExpansionSlotInventory |
+    Where-Object { $_.CurrentUsage -eq "Available" }
+).Count
+
+$ExpansionSlotConfidence = if ($ExpansionSlotInventory.Count -eq 0) {
+    "Not reported by system firmware; physical inspection or manufacturer documentation required"
+}
+
+$PCIeDevicesWithLinkData = @(
+    $PciDeviceInventory |
+    Where-Object {
+        $_.CurrentLinkSpeed -ne "Unknown / Not Exposed" -or
+        $_.CurrentLinkWidth -ne "Unknown / Not Exposed" -or
+        $_.MaxLinkSpeed -ne "Unknown / Not Exposed" -or
+        $_.MaxLinkWidth -ne "Unknown / Not Exposed"
+    }
+).Count
+
+$PCIeInventoryConfidence = if ($PciDeviceInventory.Count -eq 0) {
+    "No PCI/PCIe Plug and Play devices were returned"
+}
+elseif ($PCIeDevicesWithLinkData -gt 0) {
+    "Installed PCI/PCIe devices were identified; link width/speed was exposed for $PCIeDevicesWithLinkData device(s)"
+}
+else {
+    "Installed PCI/PCIe devices were identified, but their drivers did not expose link width/speed properties"
+}
+
+$ExpansionSlotWarnings =
+    "Firmware-reported slot presence or availability does not prove physical access, electrical lane wiring, bracket height, card-length clearance, cooling clearance, or that another installed device blocks the slot. Confirm important upgrades with service documentation or physical inspection."
+elseif ($AvailableExpansionSlotCount -gt 0) {
+    "One or more slots are reported available by firmware; physical accessibility, lane wiring, bracket fit, and clearance remain unconfirmed"
+}
+else {
+    "Slots were reported, but no slot was affirmatively reported available; physical inspection or manufacturer documentation required"
+}
+
+if ($ExpansionSlotInventory.Count -eq 0) {
+    Add-InventoryWarning "System firmware did not expose any Win32_SystemSlot records."
+}
+elseif ($AvailableExpansionSlotCount -gt 0) {
+    Add-InventoryWarning "Firmware-reported slot availability does not confirm physical clearance, bracket compatibility, or electrical lane wiring."
+}
+
+
 
 
 # -----------------------------
@@ -1250,6 +1776,93 @@ $Inventory =
 
     ComputerType =
         $ComputerType
+
+
+    MotherboardManufacturer =
+        $PrimaryBoard.Manufacturer
+
+    MotherboardProduct =
+        $PrimaryBoard.Product
+
+    MotherboardModel =
+        $PrimaryBoard.Model
+
+    MotherboardPartNumber =
+        $PrimaryBoard.PartNumber
+
+    MotherboardSKU =
+        $PrimaryBoard.SKU
+
+    MotherboardVersion =
+        $PrimaryBoard.Version
+
+    MotherboardSerialNumber =
+        $PrimaryBoard.SerialNumber
+
+    MotherboardTag =
+        $PrimaryBoard.Tag
+
+    MotherboardSlotLayout =
+        $PrimaryBoard.SlotLayout
+
+    MotherboardHostingBoard =
+        $PrimaryBoard.HostingBoard
+
+    MotherboardReplaceable =
+        $PrimaryBoard.Replaceable
+
+    MotherboardRemovable =
+        $PrimaryBoard.Removable
+
+    MotherboardRequiresDaughterBoard =
+        $PrimaryBoard.RequiresDaughterBoard
+
+    MotherboardDetails =
+        $MotherboardDetails
+
+
+    BIOSManufacturer =
+        (Normalize-Text $BIOS.Manufacturer)
+
+    BIOSVersion =
+        $BIOSVersionText
+
+    BIOSSMBIOSVersion =
+        $BIOS.SMBIOSBIOSVersion
+
+    BIOSReleaseDate =
+        $BIOSReleaseDate
+
+    FirmwareBootMode =
+        $FirmwareBootMode
+
+    BIOSDetails =
+        $BIOSDetails
+
+
+    ExpansionSlotCount =
+        $ExpansionSlotInventory.Count
+
+    AvailableExpansionSlotCount =
+        $AvailableExpansionSlotCount
+
+    ExpansionSlots =
+        ($ExpansionSlots -join " | ")
+
+    InstalledPCIeDeviceCount =
+        $PciDeviceInventory.Count
+
+    InstalledPCIeDevices =
+        ($InstalledPCIeDevices -join " | ")
+
+    ExpansionSlotConfidence =
+        $ExpansionSlotConfidence
+
+    PCIeInventoryConfidence =
+        $PCIeInventoryConfidence
+
+    ExpansionSlotWarnings =
+        $ExpansionSlotWarnings
 
 
 
