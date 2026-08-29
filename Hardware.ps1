@@ -1,6 +1,25 @@
-# Hardware Inventory Export - Audited v5
+# Hardware Inventory Export - Audited v5.1
 # Windows 11 / PowerShell 5.1+
 # Saves CSV to C:\Temp\<Manufacturer> <Model>.csv
+#
+# v5 additions:
+#   - Restored drive, RAM, and network collection
+#   - Motherboard manufacturer, model, version, serial, and asset tag
+#   - BIOS/SMBIOS and UEFI/Legacy boot details
+#   - Firmware-declared expansion-slot inventory and availability summary
+#   - Installed PCI/PCIe Plug and Play devices
+#   - PCIe maximum/current link speed and width when exposed by the driver
+#   - Confidence and warning fields for expansion-slot conclusions
+#   - CIM-based collection; no WMIC.exe or Get-WmiObject dependency
+#
+# Retained v4 additions:
+#   - GPU driver version
+#   - GPU driver date
+#   - Current display resolution
+#   - Current refresh rate
+#   - Active display connection type
+#   - Audio devices
+#   - CPU family/model/stepping metadata
 #
 # GPU memory collection order:
 #   1. NVIDIA-SMI for NVIDIA adapters when available
@@ -12,6 +31,8 @@
 
 $ErrorActionPreference = "Stop"
 $Warnings = New-Object System.Collections.Generic.List[string]
+
+Write-Output "Starting Hardware Inventory Export - Audited v5.1 (CIM motherboard/PCIe build)"
 
 function Add-InventoryWarning {
     param([string]$Message)
