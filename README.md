@@ -1,0 +1,1 @@
+These two scripts are designed to be run on Windows to capture a variety of data points about the hardware installed on the system as well as the technical specifications of the monitor that is connected to the device.
